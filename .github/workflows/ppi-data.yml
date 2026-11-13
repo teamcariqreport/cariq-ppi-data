@@ -1,0 +1,93 @@
+name: Build PPI shop data
+
+on:
+  schedule:
+    - cron: "23 9 6 1,4,7,10 *"   # 6th of Jan/Apr/Jul/Oct, 09:23 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild even if this Overture release was already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Find latest Overture release
+        id: rel
+        run: |
+          REL=$(curl -s "https://overturemaps-us-west-2.s3.us-west-2.amazonaws.com/?list-type=2&prefix=release/&delimiter=/" \
+            | grep -o '<Prefix>release/[^/<]*/</Prefix>' | sed 's#<Prefix>release/##; s#/</Prefix>##' | sort | tail -1)
+          echo "release=$REL" >> "$GITHUB_OUTPUT"
+          echo "tag=data-$REL" >> "$GITHUB_OUTPUT"
+          echo "Latest Overture release: $REL"
+
+      - name: Skip if already published
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.rel.outputs.tag }}" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"; echo "Already published, nothing to do."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download shops from Overture
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          pip install duckdb
+          python scripts/overture-repair-shops.py "" "${{ steps.rel.outputs.release }}"
+
+      - name: Clean and split by state
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          python scripts/ppi-clean.py overture-repair-shops-US.csv data/us-zips.csv out | tee clean-log.txt
+          python - <<'PY'
+          import json, os, gzip, hashlib, datetime
+          files = sorted(f for f in os.listdir("out") if f.endswith(".csv.gz"))
+          states = {}
+          for f in files:
+              p = os.path.join("out", f)
+              with gzip.open(p, "rt") as fh:
+                  rows = sum(1 for _ in fh) - 1
+              states[f[10:12]] = {"file": f, "rows": rows, "sha256": hashlib.sha256(open(p, "rb").read()).hexdigest()}
+          json.dump({
+              "release": os.environ["REL"],
+              "built": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "total": sum(s["rows"] for s in states.values()),
+              "states": states,
+          }, open("out/manifest.json", "w"), indent=1)
+          print("states:", len(states), "total:", sum(s["rows"] for s in states.values()))
+          PY
+        env:
+          REL: ${{ steps.rel.outputs.release }}
+
+      - name: Sanity check
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          TOTAL=$(python -c "import json;print(json.load(open('out/manifest.json'))['total'])")
+          if [ "$TOTAL" -lt 250000 ]; then echo "Only $TOTAL shops, which looks wrong. Not publishing."; exit 1; fi
+
+      - name: Publish release
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.rel.outputs.tag }}"
+          gh release delete "$TAG" --yes --cleanup-tag >/dev/null 2>&1 || true
+          gh release create "$TAG" out/*.csv.gz out/manifest.json \
+            --title "Shop data ${{ steps.rel.outputs.release }}" \
+            --notes "$(printf 'US auto repair and inspection shops for the Car IQ PPI Finder, built from Overture Maps release %s.\n\n```\n%s\n```\n\nData (c) Overture Maps Foundation contributors: CDLA-Permissive-2.0, Apache-2.0, CC0.' "${{ steps.rel.outputs.release }}" "$(head -3 clean-log.txt)")" \
+            --latest
